@@ -1,0 +1,120 @@
+variables:
+  ARTIFACT_NAME: cars-api-v$CI_PIPELINE_IID.jar
+#  $CI_PIPELINE_IID for version control (unique id)
+  APP_NAME: cars-api
+
+stages:
+  - build
+  - test
+  - deploy
+  - post deploy
+  - publishing
+
+build:
+  stage: build
+  image: openjdk:12-alpine
+  script:
+    - sed -i "s/CI_PIPELINE_IID/$CI_PIPELINE_IID/" ./src/main/resources/application.yml
+    - sed -i "s/CI_COMMIT_SHORT_SHA/$CI_COMMIT_SHORT_SHA/" ./src/main/resources/application.yml
+    - sed -i "s/CI_COMMIT_BRANCH/$CI_COMMIT_BRANCH/" ./src/main/resources/application.yml
+#    changing application information with gitlab ci/cd
+    - ./gradlew build
+    - mv ./build/libs/cars-api.jar ./build/libs/$ARTIFACT_NAME
+#    move the file (with new version name)
+  artifacts:
+    paths:
+      - ./build/libs/
+
+smoke test:
+  stage: test
+  image: openjdk:12-alpine
+  before_script:
+    - apk --no-cache add curl
+#   Installing curl
+  script:
+    - java -jar ./build/libs/$ARTIFACT_NAME &
+#   build jar file
+    - sleep 30
+    - curl http://localhost:5000/actuator/health | grep "UP"
+#   search for specific string     | create an input for next command
+
+code quality:
+  stage: test
+  image: openjdk:12-alpine
+  script:
+    - ./gradlew pmdMain pmdTest
+#    static test for codes in Main and Test
+  artifacts:
+    when: always
+#    even if job fails we want to see the reports
+    paths:
+      - build/reports/pmd
+#     reports saved as artifacts
+
+unit tests:
+  stage: test
+  image: openjdk:12-alpine
+  script:
+    - ./gradlew test
+#   executes test command
+  artifacts:
+    when: always
+#    even if job fails we want to see the reports
+    paths:
+      - build/reports/tests
+#   reports saved as artifacts
+    reports:
+      junit: build/test-results/test/*.xml
+#   all reports saved as xml file
+
+deploy:
+  stage: deploy
+  image:
+    name: banst/awscli
+#   that is an image that includes AWS cli
+    entrypoint: [""]
+#   override entry point - no entry point
+  before_script:
+    - apk --no-cache add curl
+#   install curl
+    - apk --no-cache add jq
+#   parser of JSON file
+  script:
+    - aws configure set region us-east-2
+#    defining aws region
+    - aws s3 cp ./build/libs/$ARTIFACT_NAME s3://$S3_BUCKET/$ARTIFACT_NAME
+#    copying jar file from folder to S3 bucket, $S3_BUCKET is defined as environment variable in Gitlab
+    - aws elasticbeanstalk create-application-version --application-name $APP_NAME --version-label $CI_PIPELINE_IID --source-bundle S3Bucket=$S3_BUCKET,S3Key=$ARTIFACT_NAME
+#    create application version (NOT ACTIVE) $APP_NAME = cars-api and specify the jar file location in S3
+    - CNAME=$(aws elasticbeanstalk update-environment --application-name $APP_NAME --environment-name "Carsapi-env" --version-label=$CI_PIPELINE_IID | jq '.CNAME' --raw-output)
+#    for activating version and getting domain name and assign in CNAME
+    - sleep 50
+    - curl http://$CNAME/actuator/info | grep $CI_PIPELINE_IID
+#    checking version
+    - curl http://$CNAME/actuator/health | grep "UP"
+#    checking health of application
+
+api testing:
+  stage: post deploy
+  image:
+    name: vdespa/newman
+    entrypoint: [""]
+  script:
+    - newman --version
+    - newman run "Cars API.postman_collection.json" --environment production.postman_environment.json --reporters cli,htmlextra,junit --reporter-htmlextra-export "newman/report.html" --reporter-junit-export "newman/report.xml"
+  artifacts:
+    when: always
+    paths:
+      - newman/
+    reports:
+      junit: newman/report.xml
+
+pages:
+  stage: publishing
+  script:
+    - mkdir public
+    - mv newman/report.html public/index.html
+  artifacts:
+    paths:
+      - public
+
